@@ -1,4 +1,4 @@
-name: Build QBLHook dylib
+name: Build QBLHook
 
 on:
   workflow_dispatch:
@@ -12,48 +12,56 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Theos
+      - name: Show Xcode / SDK
         run: |
-          git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
-          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
-          echo "$HOME/theos/bin" >> $GITHUB_PATH
+          xcode-select -p
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
+          clang --version
 
-      - name: Install SDK
-        run: |
-          mkdir -p "$HOME/theos/sdks"
-          cd "$HOME/theos/sdks"
-          git clone --depth 1 https://github.com/theos/sdks.git tmp
-          mv tmp/*.sdk . 2>/dev/null || true
-          rm -rf tmp
-          ls "$THEOS/sdks"
-
-      - name: Build and report
+      - name: Build dylib
         run: |
           set +e
-          make clean > /dev/null 2>&1
-          make > build.log 2>&1
-          EXIT=$?
-          echo "MAKE_EXIT=$EXIT"
-          # 逐行输出成 annotation（API 可读）
-          sed -n '1,80p' build.log | sed 's/\r//g' | while IFS= read -r line; do
-            [ -n "$line" ] && echo "::error title=make::$line"
-          done
-          # 也放 summary
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK"
+          xcrun --sdk iphoneos clang \
+            -arch arm64 -arch arm64e \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -dynamiclib \
+            -fobjc-arc \
+            -o QBLHook.dylib \
+            QBLHook.m \
+            -framework Foundation -framework UIKit \
+            -install_name @executable_path/Frameworks/QBLHook.dylib \
+            2>&1 | tee build.log
+          echo "EXIT=${PIPESTATUS[0]}"
           {
-            echo "## build.log"
+            echo "## clang build"
             echo '```'
             cat build.log
             echo '```'
           } >> $GITHUB_STEP_SUMMARY
-          if [ $EXIT -ne 0 ]; then exit 1; fi
+          ls -la QBLHook.dylib 2>/dev/null
 
-      - name: Find dylib
-        run: find . -name "*.dylib" 2>/dev/null; find .theos -type f 2>/dev/null | head -30
+      - name: Report errors
+        run: |
+          if [ ! -f QBLHook.dylib ]; then
+            head -30 build.log | sed 's/\r//g' | while IFS= read -r l; do
+              [ -n "$l" ] && echo "::error title=clang::$l"
+            done
+            exit 1
+          fi
+
+      - name: Verify
+        run: |
+          file QBLHook.dylib
+          otool -h QBLHook.dylib | head -8
 
       - name: Upload
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: QBLHook-dylib
-          path: "**/*.dylib"
+          path: QBLHook.dylib
           if-no-files-found: error
