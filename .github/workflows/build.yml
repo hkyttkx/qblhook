@@ -28,36 +28,18 @@ jobs:
           ls -la
 
       - name: Build
-        id: b
-        continue-on-error: true
         run: |
           make clean || true
-          make > build.log 2>&1
-          echo "make_exit=$?" >> $GITHUB_OUTPUT
-
-      - name: Show tail in summary
-        if: always()
-        run: |
-          echo "### Build log tail" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          tail -60 build.log >> $GITHUB_STEP_SUMMARY || true
-          echo '```' >> $GITHUB_STEP_SUMMARY
-
-      - name: Emit error annotation
-        if: steps.b.outputs.make_exit != '0'
-        run: |
-          # 把日志尾部逐行打成 error annotation，API 可读
-          tail -20 build.log | while IFS= read -r line; do
-            echo "::error::$line"
-          done
-          exit 1
+          make
+          echo "=== 全盘找 dylib ==="
+          find . -name "*.dylib" 2>/dev/null
+          echo "=== .theos 结构 ==="
+          find .theos -type f 2>/dev/null | head -40
 
       - name: Upload artifact
-        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: QBLHook-dylib
           path: |
-            .theos/obj/**/*.dylib
             **/*.dylib
           if-no-files-found: error
