@@ -1,173 +1,200 @@
-// AQProbe v4 — 放行校验 + 吞掉失败提示 + 主动拉起 ImGui 悬浮窗
+// CryptoHook MVP1 — 通用 iOS 加解密 Hook
+// 技术：dyld interpose（__DATA,__interpose），自包含，不依赖 substrate
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
-#import <objc/message.h>
-#import <UIKit/UIKit.h>
+#include <CommonCrypto/CommonCrypto.h>
+#include <CommonCrypto/CommonHMAC.h>
+#include <Security/Security.h>
+#include <dlfcn.h>
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+#include <unistd.h>
 
-static NSMutableArray *gLog = nil;
+#define LogPath "/var/mobile/Library/Logs/CryptoHook.log"
+static FILE *gFp = NULL;
 
-static void L(NSString *fmt,...){
+static void mklog(void){
+    if(gFp) return;
+    gFp=fopen(LogPath,"a");
+    if(!gFp) gFp=fopen("/tmp/CryptoHook.log","a");
+}
+
+static NSString *hexdump(const void *p, size_t n){
+    if(!p||!n) return @"(null)";
+    const uint8_t *b=(const uint8_t*)p;
+    size_t lim = n>512?512:n;
+    NSMutableString *s=[NSMutableString stringWithCapacity:lim*2];
+    for(size_t i=0;i<lim;i++) [s appendFormat:@"%02x",b[i]];
+    if(n>lim) [s appendFormat:@"...(共%luB)",(unsigned long)n];
+    return s;
+}
+static NSString *tryText(const void *p, size_t n){
+    if(!p||!n||n>4096) return nil;
+    NSData *d=[NSData dataWithBytes:p length:n];
+    NSString *s=[[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    if(s&&s.length>0) return s;
+    return nil;
+}
+static void LOG(NSString *fmt,...){
     va_list ap; va_start(ap,fmt);
     NSString *s=[[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    if(gLog) [gLog addObject:s];
-    NSLog(@"[AQProbe] %@", s);
+    NSLog(@"[CryptoHook] %@",s);
+    mklog();
+    if(gFp){ fprintf(gFp,"%s\n",s.UTF8String); fflush(gFp); }
 }
 
-static BOOL retYES(id s,SEL c){return YES;}
-static BOOL retNO (id s,SEL c){return NO;}
-static BOOL retYES1(id s,SEL c,id a){return YES;}
-static BOOL retNO1 (id s,SEL c,id a){return NO;}
+#define DYLD_INTERPOSE(_rep,_old) \
+  __attribute__((used)) static struct { const void* r; const void* o; } \
+  _i_##_old __attribute__((section("__DATA,__interpose"))) = { (const void*)_rep, (const void*)_old };
 
-static BOOL ownMethod(Class c, SEL sel){
-    unsigned n=0; Method *ms=class_copyMethodList(c,&n);
-    BOOL f=NO;
-    for(unsigned i=0;i<n;i++) if(method_getName(ms[i])==sel){f=YES;break;}
-    free(ms); return f;
+// ================= ① CCCrypt =================
+static CCCryptorStatus my_CCCrypt(CCOperation op, CCAlgorithm alg, CCOptions opt,
+    const void *key, size_t keyLen, const void *iv,
+    const void *in, size_t inLen, void *out, size_t outAvail, size_t *moved) {
+    LOG(@"=== CCCrypt op=%u alg=%u opt=%u keyLen=%zu inLen=%zu", op,alg,opt,keyLen,inLen);
+    LOG(@"  KEY=%@", hexdump(key,keyLen));
+    if(iv) LOG(@"  IV =%@", hexdump(iv,16));
+    LOG(@"  IN =%@", hexdump(in,inLen));
+    NSString *t0=tryText(in,inLen); if(t0) LOG(@"  INTEXT=%@",t0);
+    CCCryptorStatus r = CCCrypt(op,alg,opt,key,keyLen,iv,in,inLen,out,outAvail,moved);
+    if(out && moved && *moved){
+        LOG(@"  OUT=%@", hexdump(out,*moved));
+        NSString *t=tryText(out,*moved); if(t) LOG(@"  OUTTEXT=%@",t);
+    }
+    LOG(@"  rc=%d", (int)r);
+    return r;
 }
-static BOOL isAqrehClass(Class c){
-    const char *img=class_getImageName(c);
-    return img && (strstr(img,"AQREH")||strstr(img,"aqreh"));
-}
+DYLD_INTERPOSE(my_CCCrypt, CCCrypt)
 
-// 吞掉失败提示（不调用原实现）
-static void my_alert(id self,SEL cmd,id msg){
-    L(@"showAlert(吞掉): %@", msg);
+// ================= CCCryptor 流式 =================
+static CCCryptorStatus my_CCCryptorCreate(CCOperation op, CCAlgorithm alg, CCOptions opt,
+    const void *key, size_t keyLen, const void *iv, CCCryptorRef *ref) {
+    LOG(@"=== CCCryptorCreate op=%u alg=%u opt=%u keyLen=%zu",op,alg,opt,keyLen);
+    LOG(@"  KEY=%@", hexdump(key,keyLen));
+    if(iv) LOG(@"  IV =%@", hexdump(iv,16));
+    return CCCryptorCreate(op,alg,opt,key,keyLen,iv,ref);
 }
+DYLD_INTERPOSE(my_CCCryptorCreate, CCCryptorCreate)
 
-static IMP o_decrypt=NULL,o_rsa=NULL,o_verify=NULL;
-static id my_decrypt(id self,SEL cmd,id data,id key){
-    id out=((id(*)(id,SEL,id,id))o_decrypt)(self,cmd,data,key);
-    NSString *p = [out isKindOfClass:[NSData class]]
-        ? [[NSString alloc] initWithData:(NSData*)out encoding:NSUTF8StringEncoding] : nil;
-    L(@"DECRYPT key=%@\n OUT=%@" , key, p ?: out);
+static CCCryptorStatus my_CCCryptorUpdate(CCCryptorRef ref, const void *in, size_t inLen,
+    void *out, size_t outAvail, size_t *moved) {
+    CCCryptorStatus r = CCCryptorUpdate(ref,in,inLen,out,outAvail,moved);
+    LOG(@"=== CCCryptorUpdate inLen=%zu -> moved=%zu",inLen,moved?*moved:0);
+    LOG(@"  IN =%@", hexdump(in,inLen));
+    if(out&&moved&&*moved) LOG(@"  OUT=%@", hexdump(out,*moved));
+    return r;
+}
+DYLD_INTERPOSE(my_CCCryptorUpdate, CCCryptorUpdate)
+
+static CCCryptorStatus my_CCCryptorFinal(CCCryptorRef ref, void *out, size_t outAvail, size_t *moved) {
+    CCCryptorStatus r = CCCryptorFinal(ref,out,outAvail,moved);
+    if(out&&moved&&*moved) LOG(@"=== CCCryptorFinal OUT=%@", hexdump(out,*moved));
+    return r;
+}
+DYLD_INTERPOSE(my_CCCryptorFinal, CCCryptorFinal)
+
+// ================= ② HMAC =================
+static void my_CCHmac(CCHmacAlgorithm alg, const void *key, size_t keyLen,
+                      const void *data, size_t dataLen, void *out) {
+    LOG(@"=== CCHmac alg=%u keyLen=%zu dataLen=%zu",alg,keyLen,dataLen);
+    LOG(@"  KEY=%@", hexdump(key,keyLen));
+    LOG(@"  DATA=%@", hexdump(data,dataLen));
+    CCHmac(alg,key,keyLen,data,dataLen,out);
+    size_t dlen = alg==kCCHmacAlgSHA256?32:alg==kCCHmacAlgSHA1?20:alg==kCCHmacAlgSHA512?64:16;
+    LOG(@"  OUT=%@", hexdump(out,dlen));
+}
+DYLD_INTERPOSE(my_CCHmac, CCHmac)
+
+// ================= 摘要 =================
+static void my_CC_SHA256(const void *data, CC_LONG len, unsigned char *md){
+    LOG(@"=== CC_SHA256 len=%u IN=%@",len,hexdump(data,len));
+    CC_SHA256(data,len,md);
+    LOG(@"  OUT=%@", hexdump(md,32));
+}
+DYLD_INTERPOSE(my_CC_SHA256, CC_SHA256)
+
+static void my_CC_MD5(const void *data, CC_LONG len, unsigned char *md){
+    LOG(@"=== CC_MD5 len=%u IN=%@",len,hexdump(data,len));
+    CC_MD5(data,len,md);
+    LOG(@"  OUT=%@", hexdump(md,16));
+}
+DYLD_INTERPOSE(my_CC_MD5, CC_MD5)
+
+// ================= 密钥派生 =================
+static int my_CCKeyDerivationPBKDF(CCPBKDFAlgorithm alg, const char *pw, size_t pwLen,
+    const uint8_t *salt, size_t saltLen, CCPseudoRandomAlgorithm prf, uint rounds,
+    uint8_t *derived, size_t derivedLen) {
+    LOG(@"=== PBKDF2 prf=%u rounds=%u saltLen=%zu derivedLen=%zu",prf,rounds,saltLen,derivedLen);
+    LOG(@"  SALT=%@", hexdump(salt,saltLen));
+    int r = CCKeyDerivationPBKDF(alg,pw,pwLen,salt,saltLen,prf,rounds,derived,derivedLen);
+    LOG(@"  KEY=%@", hexdump(derived,derivedLen));
+    return r;
+}
+DYLD_INTERPOSE(my_CCKeyDerivationPBKDF, CCKeyDerivationPBKDF)
+
+// ================= ③ Security 非对称 =================
+static CFDataRef my_SecKeyCreateDecryptedData(SecKeyRef key, SecKeyAlgorithm alg,
+                                              CFDataRef data, CFErrorRef *err) {
+    LOG(@"=== SecKeyDecrypt alg=%@ len=%lu",(__bridge id)alg,(unsigned long)CFDataGetLength(data));
+    LOG(@"  IN =%@", hexdump(CFDataGetBytePtr(data),CFDataGetLength(data)));
+    CFDataRef out = SecKeyCreateDecryptedData(key,alg,data,err);
+    if(out){ LOG(@"  OUT=%@", hexdump(CFDataGetBytePtr(out),CFDataGetLength(out)));
+        NSString *t=tryText(CFDataGetBytePtr(out),CFDataGetLength(out)); if(t) LOG(@"  OUTTEXT=%@",t); }
     return out;
 }
-static id my_rsa(id self,SEL cmd,id data){
-    NSString *p=[[NSString alloc] initWithData:(NSData*)data encoding:NSUTF8StringEncoding];
-    L(@"RSA-REQ=%@", p ?: @"(binary)");
-    return ((id(*)(id,SEL,id))o_rsa)(self,cmd,data);
+DYLD_INTERPOSE(my_SecKeyCreateDecryptedData, SecKeyCreateDecryptedData)
+
+static CFDataRef my_SecKeyCreateEncryptedData(SecKeyRef key, SecKeyAlgorithm alg,
+                                              CFDataRef data, CFErrorRef *err) {
+    LOG(@"=== SecKeyEncrypt alg=%@ len=%lu",(__bridge id)alg,(unsigned long)CFDataGetLength(data));
+    LOG(@"  IN =%@", hexdump(CFDataGetBytePtr(data),CFDataGetLength(data)));
+    CFDataRef out = SecKeyCreateEncryptedData(key,alg,data,err);
+    if(out) LOG(@"  OUT=%@", hexdump(CFDataGetBytePtr(out),CFDataGetLength(out)));
+    return out;
 }
-static BOOL my_sig(id self,SEL cmd,id sig,id data){ return YES; }
+DYLD_INTERPOSE(my_SecKeyCreateEncryptedData, SecKeyCreateEncryptedData)
 
-// 主动拉起悬浮窗
-static void kickstart(void){
-    NSArray *cls=@[@"ImGuiLoad",@"PubgLoad",@"PubgLoadTrigger"];
-    for(NSString *cn in cls){
-        Class c=NSClassFromString(cn);
-        if(!c){ L(@"类不存在: %@",cn); continue; }
-        L(@"尝试拉起 %@",cn);
-        // 类方法 load
-        if([c respondsToSelector:NSSelectorFromString(@"load")]){
-            @try{ ((void(*)(id,SEL))objc_msgSend)((id)c,NSSelectorFromString(@"load")); L(@"  +load ok"); }
-            @catch(NSException *e){ L(@"  +load 异常: %@",e); }
-        }
-        // 实例方法 load
-        @try{
-            id inst=((id(*)(id,SEL))objc_msgSend)((id)c,sel_registerName("alloc"));
-            inst=((id(*)(id,SEL))objc_msgSend)(inst,sel_registerName("init"));
-            if(inst && [inst respondsToSelector:NSSelectorFromString(@"load")]){
-                ((void(*)(id,SEL))objc_msgSend)(inst,NSSelectorFromString(@"load"));
-                L(@"  -load ok");
-            }
-        } @catch(NSException *e){ L(@"  -load 异常: %@",e); }
-    }
-    // ImGuiDrawView 直接加到 window
-    Class dv=NSClassFromString(@"ImGuiDrawView");
-    if(dv){
-        L(@"ImGuiDrawView 存在，尝试挂载");
-        UIWindow *win=nil;
-        for(UIWindow *w in [UIApplication sharedApplication].windows) if(w.isKeyWindow) win=w;
-        if(!win) win=[UIApplication sharedApplication].windows.firstObject;
-        SEL s=sel_registerName("initWithFrame:togglePtr:iconType:");
-        if([dv instancesRespondToSelector:s]){
-            @try{
-                CGRect f=win.bounds;
-                id v=((id(*)(id,SEL,CGRect,void*,id))objc_msgSend)((id)dv,s,f,NULL,@"hack");
-                if(v){ [win addSubview:v]; L(@"  已加入 window"); }
-            } @catch(NSException *e){ L(@"  挂载异常: %@",e); }
-        }
-    }
-}
+// ================= ④ ObjC 自研方法扫描 =================
+static const char *kKW[]={"decrypt","encrypt","aes","rsa","hmac","cipher","crypto",
+                          "derive","nonce","sign","digest","md5","sha","crypt","key",NULL};
 
-static void showLog(void){
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *win=nil;
-        for(UIWindow *w in [UIApplication sharedApplication].windows) if(w.isKeyWindow) win=w;
-        if(!win) win=[UIApplication sharedApplication].windows.firstObject;
-        UIViewController *root=win.rootViewController;
-        while(root.presentedViewController) root=root.presentedViewController;
-        if(!root) return;
-        NSString *msg=[gLog componentsJoinedByString:@"\n"];
-        if(msg.length>3400) msg=[msg substringFromIndex:msg.length-3400];
-        UIAlertController *al=[UIAlertController alertControllerWithTitle:@"AQProbe v4"
-                                    message:msg preferredStyle:UIAlertControllerStyleAlert];
-        [al addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [root presentViewController:al animated:YES completion:nil];
-    });
-}
-
-static void run(void){
-    gLog=[NSMutableArray array];
-    L(@"== AQProbe v4 ==");
-
-    struct { const char*n; IMP i; } tab[]={
-        {"verifyResponseSignature:forData:",(IMP)my_sig},
-        {"isProxy",(IMP)retNO},
-        {"isAllowedAuthURL:",(IMP)retYES1},
-        {"isNonceUsed:",(IMP)retNO1},
-        {NULL,NULL}
-    };
-    struct { const char*n; IMP i; IMP*o; } rec[]={
-        {"decryptData:withKey:",(IMP)my_decrypt,&o_decrypt},
-        {"rsaEncryptData:",(IMP)my_rsa,&o_rsa},
-        {NULL,NULL,NULL}
-    };
-
+static void scanObjC(void){
     int n=objc_getClassList(NULL,0);
     Class *list=(Class*)malloc(sizeof(Class)*n);
     objc_getClassList(list,n);
-    int hits=0;
+    int cnt=0;
     for(int i=0;i<n;i++){
         Class c=list[i];
-        if(!isAqrehClass(c)) continue;
-        hits++;
-        @try{
-            for(int k=0;tab[k].n;k++){
-                SEL sel=sel_registerName(tab[k].n);
-                if(!ownMethod(c,sel)) continue;
-                Method m=class_getInstanceMethod(c,sel);
-                if(method_getImplementation(m)!=tab[k].i){ method_setImplementation(m,tab[k].i); L(@"[%s] hook %s",class_getName(c),tab[k].n); }
+        const char *img=class_getImageName(c);
+        if(!img) continue;
+        // 跳过纯系统框架（保留 app + 第三方 dylib + framework）
+        if(strstr(img,"/usr/lib/")||strstr(img,"/System/Library/Frameworks/")) continue;
+        unsigned mc=0; Method *ms=class_copyMethodList(c,&mc);
+        for(unsigned k=0;k<mc;k++){
+            const char *sn=sel_getName(method_getName(ms[k]));
+            char low[300]; size_t L=strlen(sn); if(L>280)L=280;
+            for(size_t j=0;j<L;j++) low[j]=(char)tolower((unsigned char)sn[j]);
+            low[L]=0;
+            for(int w=0;kKW[w];w++){
+                if(strstr(low,kKW[w])){
+                    LOG(@"[OBJC] <%s> -%s  enc=%s",class_getName(c),sn,
+                        method_getTypeEncoding(ms[k]));
+                    cnt++; break;
+                }
             }
-            for(int k=0;rec[k].n;k++){
-                SEL sel=sel_registerName(rec[k].n);
-                if(!ownMethod(c,sel)) continue;
-                Method m=class_getInstanceMethod(c,sel);
-                IMP cur=method_getImplementation(m);
-                if(cur!=rec[k].i){ *rec[k].o=cur; method_setImplementation(m,rec[k].i); L(@"[%s] rec %s",class_getName(c),rec[k].n); }
-            }
-            // 吞提示：任何类上定义都替换
-            SEL sa=sel_registerName("showAlertWithMessage");
-            if(ownMethod(c,sa)){
-                Method m=class_getInstanceMethod(c,sa);
-                if(method_getImplementation(m)!=(IMP)my_alert){ method_setImplementation(m,(IMP)my_alert); L(@"[%s] 吞掉 showAlertWithMessage",class_getName(c)); }
-            }
-        } @catch(NSException *e){}
+        }
+        free(ms);
     }
     free(list);
-    L(@"aqreh 类=%d",hits);
-
-    // 3 秒后主动拉起悬浮窗
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3.0*NSEC_PER_SEC)),
-                   dispatch_get_main_queue(),^{
-        kickstart();
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1.5*NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ showLog(); });
-    });
+    LOG(@"[OBJC] 命中加解密相关方法: %d",cnt);
 }
 
 __attribute__((constructor))
 static void init(void){
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3.0*NSEC_PER_SEC)),
-                   dispatch_get_main_queue(),^{ run(); });
+    LOG(@"");
+    LOG(@"========== CryptoHook MVP1 loaded (pid=%d) ==========", getpid());
+    scanObjC();
+    LOG(@"========== scan done ==========");
 }
