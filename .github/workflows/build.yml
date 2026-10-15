@@ -18,32 +18,39 @@ jobs:
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
           echo "$HOME/theos/bin" >> $GITHUB_PATH
 
-      - name: Install iOS SDK
+      - name: Install SDK
         run: |
           mkdir -p "$HOME/theos/sdks"
           cd "$HOME/theos/sdks"
-          # theos/sdks 仓库直接 clone，里面就是解压好的 sdk
-          git clone --depth 1 https://github.com/theos/sdks.git tmp_sdks
-          mv tmp_sdks/*.sdk . 2>/dev/null || true
-          rm -rf tmp_sdks
+          git clone --depth 1 https://github.com/theos/sdks.git tmp
+          mv tmp/*.sdk . 2>/dev/null || true
+          rm -rf tmp
           ls -la
+
+      - name: Debug env
+        run: |
+          echo "THEOS=$THEOS"
+          ls "$THEOS/sdks" || true
+          ls "$THEOS/bin" || true
+          echo "--- make version ---"
+          make --version | head -1
 
       - name: Build
         run: |
+          set -x
           make clean || true
-          make
-          echo "=== dylib 产物 ==="
-          find . -name "*.dylib" -not -path "./.git/*" -exec ls -la {} \;
+          make 2>&1 | tee build.log
+          echo "exit=$?"
 
-      - name: Sign (ldid)
+      - name: Show log on failure
+        if: failure()
         run: |
-          DY=$(find . -name "QBLHook.dylib" | head -1)
-          echo "dylib: $DY"
-          if [ -n "$DY" ]; then
-            ldid -S "$DY" || echo "ldid 签名失败，不影响越狱使用"
-          fi
+          echo "======== BUILD LOG ========"
+          cat build.log || true
+          echo "======== END ========"
 
       - name: Upload artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: QBLHook-dylib
@@ -51,3 +58,11 @@ jobs:
             .theos/obj/**/*.dylib
             **/*.dylib
           if-no-files-found: error
+
+      - name: Upload log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: warn
