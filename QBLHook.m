@@ -1,5 +1,5 @@
-// QBLHook.x — 让本地授权校验恒真
-// 纯 runtime API，不依赖 substrate/CydiaSubstrate，GitHub 上可直接编
+// QBLHook.m — 授权校验 bypass
+// 纯 Objective-C runtime，Xcode clang 直接编译
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -13,30 +13,24 @@ static void hookAll(void) {
     if (!list) return;
     objc_getClassList(list, n);
 
-    const char *names[] = { "validKey", "isHackActive", "isValidKey", "activated", NULL };
+    const char *names[] = { "validKey", "isHackActive", "isValidKey", "activated",
+                            "isActivated", "isVip", "isPremium", NULL };
 
     for (int i = 0; i < n; i++) {
         Class c = list[i];
-        const char *cname = class_getName(c);
 
         for (int k = 0; names[k]; k++) {
             SEL sel = sel_registerName(names[k]);
             Method m = class_getInstanceMethod(c, sel);
             if (!m) continue;
-
-            IMP cur = method_getImplementation(m);
-            if (cur == (IMP)fake_TRUE) continue;
-
+            if (method_getImplementation(m) == (IMP)fake_TRUE) continue;
             method_setImplementation(m, (IMP)fake_TRUE);
-            NSLog(@"[QBLHook] hooked -[%s %s]", cname, names[k]);
+            NSLog(@"[QBLHook] hooked -[%s %s]", class_getName(c), names[k]);
         }
 
-        // setter 也顶掉，防它把状态写回 NO
-        SEL setter = sel_registerName("setValidKey:");
-        Method sm = class_getInstanceMethod(c, setter);
-        if (sm) {
-            method_setImplementation(sm, (IMP)fake_TRUE);
-        }
+        // setter：永远置 YES
+        Method sm = class_getInstanceMethod(c, sel_registerName("setValidKey:"));
+        if (sm) method_setImplementation(sm, (IMP)fake_TRUE);
     }
     free(list);
 }
@@ -44,13 +38,14 @@ static void hookAll(void) {
 __attribute__((constructor))
 static void QBLHookInit(void) {
     NSLog(@"[QBLHook] loaded");
-
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ hookAll(); });
-
+                   dispatch_get_main_queue(), ^{
+        hookAll();
+        NSLog(@"[QBLHook] hook pass 1 done");
+    });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         hookAll();
-        NSLog(@"[QBLHook] hook pass done");
+        NSLog(@"[QBLHook] hook pass 2 done");
     });
 }
