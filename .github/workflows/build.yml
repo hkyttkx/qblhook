@@ -25,21 +25,35 @@ jobs:
           git clone --depth 1 https://github.com/theos/sdks.git tmp
           mv tmp/*.sdk . 2>/dev/null || true
           rm -rf tmp
-          ls -la
+          ls "$THEOS/sdks"
 
-      - name: Build
+      - name: Build and report
         run: |
-          make clean || true
-          make
-          echo "=== 全盘找 dylib ==="
-          find . -name "*.dylib" 2>/dev/null
-          echo "=== .theos 结构 ==="
-          find .theos -type f 2>/dev/null | head -40
+          set +e
+          make clean > /dev/null 2>&1
+          make > build.log 2>&1
+          EXIT=$?
+          echo "MAKE_EXIT=$EXIT"
+          # 逐行输出成 annotation（API 可读）
+          sed -n '1,80p' build.log | sed 's/\r//g' | while IFS= read -r line; do
+            [ -n "$line" ] && echo "::error title=make::$line"
+          done
+          # 也放 summary
+          {
+            echo "## build.log"
+            echo '```'
+            cat build.log
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+          if [ $EXIT -ne 0 ]; then exit 1; fi
 
-      - name: Upload artifact
+      - name: Find dylib
+        run: find . -name "*.dylib" 2>/dev/null; find .theos -type f 2>/dev/null | head -30
+
+      - name: Upload
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: QBLHook-dylib
-          path: |
-            **/*.dylib
+          path: "**/*.dylib"
           if-no-files-found: error
