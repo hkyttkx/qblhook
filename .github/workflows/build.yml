@@ -5,6 +5,9 @@ on:
   push:
     branches: [ main ]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-14
@@ -24,23 +27,13 @@ jobs:
             -framework Foundation -framework UIKit \
             -install_name @executable_path/Frameworks/QBLHook.dylib
           ls -la QBLHook.dylib
-          file QBLHook.dylib
 
-      - name: Encode to annotation (chunked)
+      - name: Commit dylib back to repo
         run: |
-          # dylib 很小，base64 后分块打成 error annotation，外部 API 可读
-          B64=$(base64 -i QBLHook.dylib | tr -d '\n')
-          TOTAL=$(echo -n "$B64" | wc -c)
-          echo "b64 len: $TOTAL"
-          echo "::error title=QBLHOOK_B64_START::len=$TOTAL"
-          # 每块 900 字符
-          echo "$B64" | fold -w 900 | nl -ba | while read -r num chunk; do
-            echo "::error title=QBLHOOK_B64_${num}::${chunk}"
-          done
-          echo "::error title=QBLHOOK_B64_END::done"
-
-      - name: Also upload
-        uses: actions/upload-artifact@v4
-        with:
-          name: QBLHook-dylib
-          path: QBLHook.dylib
+          mkdir -p dist
+          cp QBLHook.dylib dist/
+          git config user.name "gh-actions"
+          git config user.email "actions@github.com"
+          git add -f dist/QBLHook.dylib
+          git commit -m "build: QBLHook.dylib [skip ci]" || echo "no change"
+          git push
