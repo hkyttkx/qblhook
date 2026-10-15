@@ -12,56 +12,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Show Xcode / SDK
-        run: |
-          xcode-select -p
-          xcrun --sdk iphoneos --show-sdk-path
-          xcrun --sdk iphoneos --show-sdk-version
-          clang --version
-
       - name: Build dylib
         run: |
-          set +e
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          echo "SDK=$SDK"
           xcrun --sdk iphoneos clang \
             -arch arm64 -arch arm64e \
             -isysroot "$SDK" \
             -miphoneos-version-min=14.0 \
-            -dynamiclib \
-            -fobjc-arc \
-            -o QBLHook.dylib \
-            QBLHook.m \
+            -dynamiclib -fobjc-arc \
+            -o QBLHook.dylib QBLHook.m \
             -framework Foundation -framework UIKit \
-            -install_name @executable_path/Frameworks/QBLHook.dylib \
-            2>&1 | tee build.log
-          echo "EXIT=${PIPESTATUS[0]}"
-          {
-            echo "## clang build"
-            echo '```'
-            cat build.log
-            echo '```'
-          } >> $GITHUB_STEP_SUMMARY
-          ls -la QBLHook.dylib 2>/dev/null
-
-      - name: Report errors
-        run: |
-          if [ ! -f QBLHook.dylib ]; then
-            head -30 build.log | sed 's/\r//g' | while IFS= read -r l; do
-              [ -n "$l" ] && echo "::error title=clang::$l"
-            done
-            exit 1
-          fi
-
-      - name: Verify
-        run: |
+            -install_name @executable_path/Frameworks/QBLHook.dylib
+          ls -la QBLHook.dylib
           file QBLHook.dylib
-          otool -h QBLHook.dylib | head -8
 
-      - name: Upload
-        if: success()
+      - name: Encode to annotation (chunked)
+        run: |
+          # dylib 很小，base64 后分块打成 error annotation，外部 API 可读
+          B64=$(base64 -i QBLHook.dylib | tr -d '\n')
+          TOTAL=$(echo -n "$B64" | wc -c)
+          echo "b64 len: $TOTAL"
+          echo "::error title=QBLHOOK_B64_START::len=$TOTAL"
+          # 每块 900 字符
+          echo "$B64" | fold -w 900 | nl -ba | while read -r num chunk; do
+            echo "::error title=QBLHOOK_B64_${num}::${chunk}"
+          done
+          echo "::error title=QBLHOOK_B64_END::done"
+
+      - name: Also upload
         uses: actions/upload-artifact@v4
         with:
           name: QBLHook-dylib
           path: QBLHook.dylib
-          if-no-files-found: error
